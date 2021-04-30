@@ -15,6 +15,8 @@ import (
     "hash/fnv"
     "unicode"
     "strconv"
+    "runtime"
+    "math"
 )
 
 const (
@@ -141,7 +143,7 @@ func splitDatabase(source, outputDir, outputPattern string, m int) ([]string, er
 
 
 func mergeDatabases(urls []string, path, temp string) (*sql.DB, error) {
-    //fmt.Printf("downloading %d files from %s into %s and merging them into new file %s\n", len(urls), temp, outDir, path)
+    //fmt.Printf("downloading %d files from %s into %s and merging them into new file %s\n", len(urls), temp, temp, path)
     db, err := createDatabase(path)
     for _, u := range urls {
         // DOWNLOAD
@@ -150,7 +152,7 @@ func mergeDatabases(urls []string, path, temp string) (*sql.DB, error) {
         s := strings.Split(filename, "/")
         filename = s[len(s)-1]
         p := filepath.Join(temp, filename)
-        f, err := os.Create(p)
+        /*f, err := os.Create(p)
         if err != nil {
             return db, err
         }
@@ -160,24 +162,24 @@ func mergeDatabases(urls []string, path, temp string) (*sql.DB, error) {
         resp.Body.Close()
         if err != nil {
             return db, err
-        }
+        }*/
         // MERGE
         _, err = db.Exec("attach ? as merge; insert into pairs select * from merge.pairs; detach merge", p)
         if err != nil {
             return db, err
         }
         // DELETE
+        /*
         parts := strings.Split(u, "/")
         err = os.Remove(filepath.Join(temp, parts[len(parts)-1]))
         if err != nil {
             return db, err
-        }
+        }*/
         err = os.Remove(p)
         if err != nil {
             return db, err
         }
     }
-    db.Close()
     return db, err
 }
 
@@ -212,25 +214,32 @@ func (task *MapTask) Process(tempdir string, client Interface, is_routine bool, 
     if err != nil {
         return err
     }
+    statements := make(map[string]*sql.Stmt)
     for r := 0; r < task.R; r++ {
-        out_db, err := createDatabase(filepath.Join(tempdir, mapOutputFile(task.N, r)))
+        filename := mapOutputFile(task.N, r)
+        out_db, err := createDatabase(filepath.Join(tempdir, filename))
         _, _ = out_db.Exec("CREATE TABLE pairs(key text, value text)")
         if err != nil {
             return err
         }
+        statements[filename], err = out_db.Prepare("INSERT INTO pairs VALUES(?, ?)")
+        if err != nil {
+            return err
+        }
+        defer statements[filename].Close()
     }
     pairs, err := db.Query("SELECT key, value FROM pairs")
     if err != nil {
         return err
     }
-    count := 0
+
     for pairs.Next() {
         var k, v string
         pairs.Scan(&k, &v)
         pair := Pair{Key: k, Value: v}
-        output := make(chan Pair)
+        output := make(chan Pair, 100)
         finishedMap := make(chan error)
-        go task.writeOutput(output, finishedMap, tempdir, &count)
+        go task.writeOutput(output, finishedMap, tempdir, statements)
         if err := client.Map(pair.Key, pair.Value, output); err != nil {
             return fmt.Errorf("Issue with client map: %v", err)
         }
@@ -301,88 +310,130 @@ func (task *ReduceTask) Process(tempdir string, client Interface) error {
 
 type KeySet struct {
   Key string
-  Input <-chan string
+  Input *chan string
 }
 
 
-func (task *ReduceTask) Process(tempdir string, client Interface) error {
-  // This method processes a single reduce task. It must:
+func (task *ReduceTask) Process(tempdir string, client Interface, is_routine bool, used_routines *int, first, last float64) error {
+
+    // stores map output files into a url slice of strings
+    var urls []string
+    for i := int(first); i <= int(last); i++ {
+        for j := 0; j < 3; j++ {
+            urls = append(urls, makeURL(task.SourceHosts[0], mapOutputFile(i, j)))
+            fmt.Printf("%s\n", mapOutputFile(i, j))
+        }
+    } 
 
 
-  // stores input files into a url slice of strings
-  urls := make([]string, task.M)
-  for i := 0; i < task.M; i++ {
-    urls[i] = makeURL(task.SourceHosts[i], mapInputFile(i))
-  }
+    // Create the input database by merging all of the appropriate output databases from the map phase
+    inputDB, err := mergeDatabases(urls, filepath.Join(tempdir, reduceInputFile(task.N)), tempdir)
+    if err != nil {
+        log.Fatalf("issue merging: %v", err)
+    }
 
 
-  // Create the input database by merging all of the appropriate output databases from the map phase
-  inputDB, err := mergeDatabases(urls, filepath.Join(tempdir, reduceInputFile(task.N)), "tmp.db")
-  // check the merge error
-  if err != nil {
-    return fmt.Errorf("issue merging database: %v", err)
-  }
+    // Create the output database
+    outputDB, err := createDatabase(filepath.Join(tempdir, reduceOutputFile(task.N)))
+    if err != nil {
+        return fmt.Errorf("issue creating output database: %v", err)
+    }
 
-  defer inputDB.Close()
+    // create the output statements
+    outputStatements, err := outputDB.Prepare("INSERT INTO pairs (key, value) values (?, ?)")
+    if err != nil {
+        return fmt.Errorf("issue with the prepare insert: %v", err)
+    }
+    defer outputStatements.Close()
+    // Process all pairs in the correct order
+    //i, v, j := 0,0,0
 
-  // Create the output database
-  outputDB, err := createDatabase(filepath.Join(tempdir, reduceOutputFile(task.N)))
-  if err != nil {
-    return fmt.Errorf("issue creating output database: %v", err)
-  }
-  defer outputDB.Close()
+    rows, err := inputDB.Query("SELECT key, value FROM pairs ORDER BY key, value DESC")
+    if err != nil {
+        return fmt.Errorf("issue querying input db: %v", err)
+    }
+    inputDB.Close()
+    defer rows.Close()
 
-  // create the output statements
-  outputStatements, err := outputDB.Prepare("INSERT INTO pairs (key, value) values (?, ?)")
-  if err != nil {
-    return fmt.Errorf("issue with the prepare insert: %v", err)
-  }
-  defer outputStatements.Close()
-  // Process all pairs in the correct order
-  i, v, j := 0,0,0
+    i := 0
+    var previous string
+    KeySets := make(chan KeySet, 100)
+    var currentSet KeySet
+    for rows.Next() {
+        var k, v string
+        rows.Scan(&k, &v)
+        pair := Pair{Key: k, Value: v}
+        
+        if previous != pair.Key {
+            output := make(chan Pair, 100)
+            finishedReduce := make(chan error)
+            if i != 0 {
+                set := <-KeySets
+                close(*set.Input)
+                for len(finishedReduce) > 0 {
+                    err := <-finishedReduce
+                    if err != nil {
+                        return fmt.Errorf("issue writing reduce output\n")
+                    }
+                }
+            }
+            
+            input := make(chan string, 100)
+            KeySets <- KeySet{Key: pair.Key, Input: &input}
+            currentSet = KeySet{Key: pair.Key, Input: &input}
+            
+            
+            go task.writeOutput(output, finishedReduce, outputStatements)
+            go client.Reduce(pair.Key, *currentSet.Input, output)
+        }
+        previous = pair.Key
+        *currentSet.Input <- pair.Value
+        i++
+    }
+    set := <-KeySets
+    close(*set.Input)
+    outputDB.Close()
+    /*
+    KeySets := make(chan KeySet)
+    readDone, writeDone := make(chan error), make(chan error)
+    //As you loop over the key/value pairs,
+    //take note whether the key for a new row is the same or
+    //different from the key of the previous row.
+    go readInput(rows, KeySets, readDone, &v)
 
-  rows, err := inputDB.Query("SELECT key, value FROM pairs ORDER BY key, value")
-  if err != nil {
-    return fmt.Errorf("issue querying input db: %v", err)
-  }
-  defer rows.Close()
-
-  KeySets := make(chan KeySet)
-  readDone, writeDone := make(chan error), make(chan error)
-  //As you loop over the key/value pairs,
-  //take note whether the key for a new row is the same or
-  //different from the key of the previous row.
-  go readInput(rows, KeySets, readDone, &v)
-
-  for set := range KeySets {
+    for set := range KeySets {
     i++
     reduceOutput := make(chan Pair, 100)
 
     go task.writeOutput(reduceOutput, writeDone, outputStatements, &j)
     if err := client.Reduce(set.Key, set.Input, reduceOutput); err != nil {
-      return fmt.Errorf("issue with client reduce: %v", err)
+        return fmt.Errorf("issue with client reduce: %v", err)
     }
-  }
-  log.Printf("Map Task %d processed %d pairs and generated %d pairs\n", task.N, i, v, j)
+    }
+    */
+    if is_routine == true {
+    *used_routines -= 1;
+    fmt.Printf("task %d is done and there are now %d used goroutines\n", task.N, *used_routines)
+    } else {
+    fmt.Printf("task %d is done but did not use a goroutine\n", task.N)
+    }
 
-  return nil
+    return nil
 }
 
-func (task *MapTask) writeOutput(output chan Pair, finishedMap chan<- error, tempdir string, count *int) {
+func (task *MapTask) writeOutput(output chan Pair, finishedMap chan<- error, tempdir string, statements map[string]*sql.Stmt) {
     for pair := range output {
-      *count++
-      if *count % 10000 == 0 {
-          //fmt.Printf("task %d reached %d\n", task.N, *count)
-      }
       hash := fnv.New32()
       hash.Write([]byte(pair.Key))
       r := int(hash.Sum32() % uint32(task.R))
-      out_db, err := openDatabase(filepath.Join(tempdir, mapOutputFile(task.N, r)))
+      filename := mapOutputFile(task.N, r)
+      out_db, err := openDatabase(filepath.Join(tempdir, filename))
       defer out_db.Close()
       if err != nil {
-          log.Fatalf("wtf is this/n")
+          finishedMap <- fmt.Errorf("cant open database for this reason: %v", err)
+          return
       }
-      if _, err = out_db.Exec("INSERT INTO pairs values(?, ?)", pair.Key, pair.Value); err != nil {
+      if _, err = statements[filename].Exec(pair.Key, pair.Value); err != nil {
           finishedMap <- fmt.Errorf("issue inserting: %v", err)
           return
       }
@@ -390,9 +441,8 @@ func (task *MapTask) writeOutput(output chan Pair, finishedMap chan<- error, tem
     finishedMap <- nil
 }
 
-func (task *ReduceTask) writeOutput(output <-chan Pair, finishedReduce chan<- error, stmt *sql.Stmt, count *int) {
+func (task *ReduceTask) writeOutput(output <-chan Pair, finishedReduce chan<- error, stmt *sql.Stmt) {
   for pair := range output {
-    *count++
     if _, err := stmt.Exec(pair.Key, pair.Value); err != nil {
       finishedReduce <- fmt.Errorf("issue inserting: %v", err)
       return
@@ -404,6 +454,7 @@ func (task *ReduceTask) writeOutput(output <-chan Pair, finishedReduce chan<- er
 // send reading input database to the reduce function on the client
 
 // a lot of this function is part of what we discussed with the lecture today
+/*
 func readInput(rows *sql.Rows, setChannel chan<- KeySet, finishedReduce chan error, valueCount *int) {
   var erwar error
   var previousKey string
@@ -462,9 +513,10 @@ func readInput(rows *sql.Rows, setChannel chan<- KeySet, finishedReduce chan err
 		return
 	}
 }
-
+*/
 func main() {
-    var m = 50
+    runtime.GOMAXPROCS(1)
+    var m = 11
     var r = 3
     os.Chmod(os.TempDir()+"/data", 0777)
     tempdir := filepath.Join(os.TempDir()+"/data", fmt.Sprintf("mapreduce.%d", os.Getpid()))
@@ -489,10 +541,10 @@ func main() {
     *used_routines = 0
     for i := 0; i < m; i++ {
         task := MapTask{M: m, R: r, N: i, SourceHost: address}
-        if *used_routines < 4 && i != m-1 {
+        if *used_routines < 8 {
             *used_routines += 1
             go task.Process(tempdir, client, true, used_routines)
-            fmt.Printf("processing task %d. there are %d more goroutines available\n", i, 4 - *used_routines)
+            fmt.Printf("processing task %d. there are %d more goroutines available\n", i, 8 - *used_routines)
         } else {
             fmt.Printf("processing task %d without using a goroutine\n", i)
             task.Process(tempdir, client, false, used_routines)
@@ -503,6 +555,42 @@ func main() {
         continue
     }
     fmt.Printf("Finished mapping\n")
+
+    hosts := make([]string, 1)
+    hosts[0] = address
+
+    remainder := m % r
+    offset := 0
+    var first, last float64
+    urls := make([]string, r)
+    for j := 0; j < r; j++ {
+        task := ReduceTask{M: m, R: r, N: j, SourceHosts: hosts}
+        first = float64(j * (m / r) + offset)
+        last = first + (math.Floor(float64(m / r))-1)
+        if remainder > 0 {
+            last++
+            remainder--
+            offset++
+        }
+        fmt.Printf("first: %d last: %d\n", int(first), int(last))
+
+        if *used_routines < 8 {
+            *used_routines += 1
+            go task.Process(tempdir, client, true, used_routines, first, last)
+            fmt.Printf("processing task %d. there are %d more goroutines available\n", j, 8 - *used_routines)
+        } else {
+            fmt.Printf("processing task %d without using a goroutine\n", j)
+            task.Process(tempdir, client, false, used_routines, first, last)
+        }
+        urls[j] = makeURL(hosts[0], reduceOutputFile(task.N))
+    }
+
+    for *used_routines > 0 {
+        continue
+    }
+    fmt.Printf("Finished reducing\n")
+    final_output_db, err := mergeDatabases(urls, filepath.Join(tempdir, "result.db"), tempdir)
+    final_output_db.Close()
 }
 
 
